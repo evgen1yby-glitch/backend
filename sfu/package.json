@@ -1,0 +1,21 @@
+{
+  "name": "luxemeet-sfu",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Mediasoup SFU for LuxeMeet",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "NODE_ENV=development node server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "helmet": "^7.0.0",
+    "mediasoup": "^3.14.11",
+    "socket.io": "^4.7.5",
+    "uuid": "^9.0.1"
+  }
+}
+
