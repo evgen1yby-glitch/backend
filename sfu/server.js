@@ -15,48 +15,119 @@ const BASE_PATH = process.env.SFU_BASE_PATH || '/sfu';
 const IO_PATH = process.env.SFU_IO_PATH || `${BASE_PATH}/socket.io`;
 const ANNOUNCED_IP = process.env.SFU_ANNOUNCED_IP || process.env.SFU_PUBLIC_IP || undefined;
 
-// Mediasoup worker
-let worker;
-const rooms = new Map(); // roomId -> { router, peers: Map<peerId, { transports: Set, producers: Set, consumers: Set }> }
+// Mediasoup workers pool for scalability (100+ participants)
+const workers = [];
+let nextWorkerIdx = 0;
+const NUM_WORKERS = parseInt(process.env.SFU_NUM_WORKERS || '4', 10); // Use multiple workers for 100+ participants
+const rooms = new Map(); // roomId -> { router, peers: Map<peerId, { transports: Set, producers: Set, consumers: Set }>, workerIdx }
 
-async function createMediasoupWorker() {
-  worker = await createWorker({
-    rtcMinPort: parseInt(process.env.SFU_RTC_MIN_PORT || '40000', 10),
-    rtcMaxPort: parseInt(process.env.SFU_RTC_MAX_PORT || '49999', 10),
-  });
-  worker.on('died', () => {
-    console.error('❌ Mediasoup worker died, exiting');
-    process.exit(1);
-  });
-  console.log('✅ Mediasoup worker created');
+async function createMediasoupWorkers() {
+  const numCpus = require('os').cpus().length;
+  const workersToCreate = Math.min(NUM_WORKERS, numCpus);
+  
+  console.log(`🚀 Creating ${workersToCreate} mediasoup workers (CPUs: ${numCpus})`);
+  
+  for (let i = 0; i < workersToCreate; i++) {
+    const worker = await createWorker({
+      logLevel: 'warn',
+      rtcMinPort: parseInt(process.env.SFU_RTC_MIN_PORT || '40000', 10) + (i * 2500),
+      rtcMaxPort: parseInt(process.env.SFU_RTC_MIN_PORT || '40000', 10) + ((i + 1) * 2500) - 1,
+    });
+    
+    worker.on('died', () => {
+      console.error(`❌ Mediasoup worker ${i} died, restarting...`);
+      workers[i] = null;
+      // Auto-restart worker
+      setTimeout(() => restartWorker(i), 2000);
+    });
+    
+    workers.push(worker);
+    console.log(`✅ Mediasoup worker ${i} created (ports: ${40000 + i * 2500}-${40000 + (i + 1) * 2500 - 1})`);
+  }
+}
+
+async function restartWorker(idx) {
+  try {
+    const worker = await createWorker({
+      logLevel: 'warn',
+      rtcMinPort: 40000 + (idx * 2500),
+      rtcMaxPort: 40000 + ((idx + 1) * 2500) - 1,
+    });
+    workers[idx] = worker;
+    console.log(`✅ Mediasoup worker ${idx} restarted`);
+  } catch (e) {
+    console.error(`❌ Failed to restart worker ${idx}:`, e);
+  }
+}
+
+function getNextWorker() {
+  // Round-robin worker selection
+  const worker = workers[nextWorkerIdx];
+  nextWorkerIdx = (nextWorkerIdx + 1) % workers.length;
+  return { worker, workerIdx: nextWorkerIdx };
 }
 
 async function getOrCreateRoom(roomId) {
   if (rooms.has(roomId)) return rooms.get(roomId);
+  
+  // Codecs optimized for large conferences (100+ participants)
   const mediaCodecs = [
     {
       kind: 'audio',
       mimeType: 'audio/opus',
       clockRate: 48000,
       channels: 2,
+      parameters: {
+        useinbandfec: 1,
+        usedtx: 1, // Discontinuous transmission for bandwidth saving
+        maxaveragebitrate: 32000, // Limit audio bitrate
+      },
     },
     {
       kind: 'video',
       mimeType: 'video/VP8',
       clockRate: 90000,
-      parameters: { 'x-google-start-bitrate': 1000 },
+      parameters: {
+        'x-google-start-bitrate': 300, // Lower start bitrate for many participants
+      },
+    },
+    {
+      kind: 'video',
+      mimeType: 'video/VP9',
+      clockRate: 90000,
+      parameters: {
+        'profile-id': 2,
+        'x-google-start-bitrate': 300,
+      },
+    },
+    {
+      kind: 'video',
+      mimeType: 'video/H264',
+      clockRate: 90000,
+      parameters: {
+        'packetization-mode': 1,
+        'profile-level-id': '42e01f',
+        'level-asymmetry-allowed': 1,
+        'x-google-start-bitrate': 300,
+      },
     },
   ];
+  
+  const { worker, workerIdx } = getNextWorker();
   const router = await worker.createRouter({ mediaCodecs });
+  
   const room = {
     router,
     peers: new Map(),
+    workerIdx,
+    createdAt: Date.now(),
   };
   rooms.set(roomId, room);
+  console.log(`🏠 Room ${roomId} created on worker ${workerIdx}`);
   return room;
 }
 
-function getTransportConfig() {
+function getTransportConfig(isProducer = false) {
   return {
     listenIps: [
       { ip: '0.0.0.0', announcedIp: ANNOUNCED_IP },
@@ -64,7 +135,13 @@ function getTransportConfig() {
     enableUdp: true,
     enableTcp: true,
     preferUdp: true,
-    initialAvailableOutgoingBitrate: 1_000_000,
+    // Lower bitrate for large conferences - will be adjusted per consumer
+    initialAvailableOutgoingBitrate: isProducer ? 800_000 : 600_000,
+    // Limit number of streams per transport
+    maxIncomingBitrate: 1_500_000,
+    // Enable SCTP for data channels
+    enableSctp: true,
+    numSctpStreams: { OS: 1024, MIS: 1024 },
   };
 }
 
@@ -374,11 +451,12 @@ app.get(`${BASE_PATH}/health`, (_req, res) => {
 
 // bootstrap
 (async () => {
-  await createMediasoupWorker();
+  await createMediasoupWorkers();
   server.listen(PORT, () => {
     console.log(`🚀 LuxeMeet SFU listening on ${PORT}`);
     console.log(`🌐 CORS origin: ${ALLOWED_ORIGIN}`);
     console.log(`🌐 IO path: ${IO_PATH}`);
+    console.log(`👥 Workers: ${workers.length} (optimized for 100+ participants)`);
     if (ANNOUNCED_IP) console.log(`🌐 announced IP: ${ANNOUNCED_IP}`);
   });
 })();
