@@ -337,6 +337,80 @@ io.on('connection', (socket) => {
   });
 
   // Обработка обновления имени участника
+  // Обработка паузы producer (когда участник выключает микрофон/камеру)
+  socket.on('pause-producer', async ({ producerId }, callback) => {
+    try {
+      if (!currentRoomId) {
+        return callback?.({ error: 'no room' });
+      }
+      
+      const room = rooms.get(currentRoomId);
+      const peer = room?.peers.get(currentPeerId);
+      
+      if (!peer) {
+        return callback?.({ error: 'peer not found' });
+      }
+      
+      // Находим producer и ставим на паузу
+      const producer = [...peer.producers].find(p => p.id === producerId);
+      if (producer) {
+        await producer.pause();
+        console.log(`⏸️ Producer ${producerId} paused by ${currentPeerId} (${currentPeerName})`);
+        
+        // Уведомляем других участников о паузе producer
+        socket.to(currentRoomId).emit('producer-paused', {
+          producerId,
+          peerId: currentPeerId,
+          name: currentPeerName,
+        });
+        
+        callback?.({ paused: true });
+      } else {
+        callback?.({ error: 'producer not found' });
+      }
+    } catch (e) {
+      console.error('pause-producer error:', e);
+      callback?.({ error: 'pause failed' });
+    }
+  });
+
+  // Обработка возобновления producer (когда участник включает микрофон/камеру)
+  socket.on('resume-producer', async ({ producerId }, callback) => {
+    try {
+      if (!currentRoomId) {
+        return callback?.({ error: 'no room' });
+      }
+      
+      const room = rooms.get(currentRoomId);
+      const peer = room?.peers.get(currentPeerId);
+      
+      if (!peer) {
+        return callback?.({ error: 'peer not found' });
+      }
+      
+      // Находим producer и возобновляем
+      const producer = [...peer.producers].find(p => p.id === producerId);
+      if (producer) {
+        await producer.resume();
+        console.log(`▶️ Producer ${producerId} resumed by ${currentPeerId} (${currentPeerName})`);
+        
+        // Уведомляем других участников о возобновлении producer
+        socket.to(currentRoomId).emit('producer-resumed', {
+          producerId,
+          peerId: currentPeerId,
+          name: currentPeerName,
+        });
+        
+        callback?.({ resumed: true });
+      } else {
+        callback?.({ error: 'producer not found' });
+      }
+    } catch (e) {
+      console.error('resume-producer error:', e);
+      callback?.({ error: 'resume failed' });
+    }
+  });
+
   socket.on('update-name', ({ name }) => {
     if (name && name.trim()) {
       currentPeerName = name.trim();
@@ -390,6 +464,53 @@ io.on('connection', (socket) => {
     io.to(currentRoomId).emit('chat-message', chatMessage);
     
     console.log(`✅ Chat message broadcasted to room ${currentRoomId}`);
+  });
+
+  // Обработка поднятия/опускания руки
+  socket.on('hand-raise', ({ isRaised, name }) => {
+    if (!currentRoomId) {
+      console.warn(`⚠️ hand-raise: peer ${currentPeerId} not in room`);
+      return;
+    }
+    
+    const room = rooms.get(currentRoomId);
+    const roomSize = room ? room.peers.size : 0;
+    const otherPeers = room ? Array.from(room.peers.keys()).filter(id => id !== currentPeerId) : [];
+    
+    console.log(`✋ Hand ${isRaised ? 'raised' : 'lowered'} by ${currentPeerId} (${name}) in room ${currentRoomId}`);
+    console.log(`   → Будет отправлено ${otherPeers.length} участникам:`, otherPeers);
+    
+    // Транслируем всем участникам комнаты (кроме отправителя)
+    socket.to(currentRoomId).emit('hand-raise', {
+      peerId: currentPeerId,
+      name: name || 'Участник',
+      isRaised,
+    });
+    
+    console.log(`   ✅ hand-raise событие отправлено`);
+  });
+
+  // Обработка реакций
+  socket.on('reaction', ({ reaction, name }) => {
+    if (!currentRoomId) {
+      console.warn(`⚠️ reaction: peer ${currentPeerId} not in room`);
+      return;
+    }
+    
+    const room = rooms.get(currentRoomId);
+    const otherPeers = room ? Array.from(room.peers.keys()).filter(id => id !== currentPeerId) : [];
+    
+    console.log(`😀 Reaction "${reaction}" from ${currentPeerId} (${name}) in room ${currentRoomId}`);
+    console.log(`   → Будет отправлено ${otherPeers.length} участникам:`, otherPeers);
+    
+    // Транслируем всем участникам комнаты (кроме отправителя)
+    socket.to(currentRoomId).emit('reaction', {
+      peerId: currentPeerId,
+      name: name || 'Участник',
+      reaction,
+    });
+    
+    console.log(`   ✅ reaction событие отправлено`);
   });
 
   socket.on('get-producers', (_, callback) => {
